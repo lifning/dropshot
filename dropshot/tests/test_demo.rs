@@ -32,7 +32,10 @@ use dropshot::Query;
 use dropshot::RequestContext;
 use dropshot::TypedBody;
 use dropshot::UntypedBody;
+use dropshot::WebsocketUpgrade;
 use dropshot::CONTENT_TYPE_JSON;
+use futures_util::SinkExt;
+use futures_util::StreamExt;
 use http::StatusCode;
 use hyper::Body;
 use hyper::Method;
@@ -41,6 +44,9 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde::Serialize;
 use std::sync::Arc;
+use tokio_tungstenite::WebSocketStream;
+use tungstenite::protocol::Role;
+use tungstenite::Message;
 use uuid::Uuid;
 
 extern crate slog;
@@ -60,6 +66,7 @@ fn demo_api() -> ApiDescription<usize> {
     api.register(demo_handler_untyped_body).unwrap();
     api.register(demo_handler_delete).unwrap();
     api.register(demo_handler_headers).unwrap();
+    api.register(demo_handler_websocket).unwrap();
 
     /*
      * We don't need to exhaustively test these cases, as they're tested by unit
@@ -735,6 +742,28 @@ async fn test_header_request() {
 }
 
 /*
+ * The "test_demo_websocket" handler upgrades to a websocket and exchanges
+ * greetings with the client.
+ */
+#[tokio::test]
+async fn test_demo_websocket() {
+    let api = demo_api();
+    let testctx = common::test_setup("demo_websocket", api);
+
+    let path = format!(
+        "ws://{}/testing/websocket",
+        testctx.client_testctx.bind_address
+    );
+    let (mut ws, _resp) = tokio_tungstenite::connect_async(path).await.unwrap();
+
+    ws.send(Message::Text("hello server".to_string())).await.unwrap();
+    let msg = ws.next().await.unwrap().unwrap();
+    assert_eq!(msg, Message::Text("hello client".to_string()));
+
+    testctx.teardown().await;
+}
+
+/*
  * Demo handler functions
  */
 
@@ -931,6 +960,31 @@ async fn demo_handler_headers(
     headers
         .append(TEST_HEADER_2, http::header::HeaderValue::from_static("howdy"));
     Ok(response)
+}
+
+#[endpoint {
+    method = GET,
+    path = "/testing/websocket"
+}]
+async fn demo_handler_websocket(
+    rqctx: RequestCtx,
+    websock: WebsocketUpgrade,
+) -> Result<Response<Body>, HttpError> {
+    websock
+        .handle(move |upgraded| async move {
+            use futures_util::stream::StreamExt;
+            let mut ws_stream =
+                WebSocketStream::from_raw_socket(upgraded, Role::Server, None)
+                    .await;
+            ws_stream
+                .send(Message::Text("hello client".to_string()))
+                .await
+                .unwrap();
+            let msg = ws_stream.next().await.unwrap().unwrap();
+            slog::info!(rqctx.log, "{}", msg);
+            Ok(())
+        })
+        .into()
 }
 
 fn http_echo<T: Serialize>(t: &T) -> Result<Response<Body>, HttpError> {
