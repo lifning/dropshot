@@ -23,7 +23,6 @@ use sha1::{Digest, Sha1};
 use slog::Logger;
 use std::future::Future;
 use std::sync::Arc;
-use tokio::task::JoinHandle;
 
 // re-export such that consumers need not version-match with us in their Cargo.toml
 pub use hyper::upgrade::Upgraded as HyperUpgraded;
@@ -32,10 +31,8 @@ pub use hyper::upgrade::Upgraded as HyperUpgraded;
  * WebsocketUpgrade is an Extractor used to upgrade and handle an HTTP request
  * as a websocket when present in a Dropshot endpoint's function arguments.
  *
- * The consumer of this *must* call [WebsocketUpgrade::handle] (or if they do
- * not wish to upgrade a given connection, [WebsocketUpgrade::do_not_upgrade])
- * on the owned instance in the endpoint's fn, or else WebsocketUpgrade's
- * implementation of [Drop::drop] panics when built with `debug_assertions`.
+ * The consumer of this must call [WebsocketUpgrade::handle] for the connection
+ * to be upgraded. (This is done for you by `#[channel]`.)
  */
 #[derive(Debug)]
 pub struct WebsocketUpgrade(Option<WebsocketUpgradeInner>);
@@ -44,41 +41,23 @@ pub struct WebsocketUpgrade(Option<WebsocketUpgradeInner>);
  * This is the return type of the websocket-handling future provided to
  * [WebsocketUpgrade::handle].
  */
-pub type WebsocketHandlerTaskResult<O> =
-    Result<O, Box<dyn std::error::Error + Send + Sync + 'static>>;
+pub type WebsocketChannelResult =
+    Result<(), Box<dyn std::error::Error + Send + Sync + 'static>>;
 
 /**
  * [WebsocketUpgrade::handle]'s return type.
- * Your endpoint handler should also return this type, and provide the value
- * returned by [WebsocketUpgrade::handle].
+ * The `#[endpoint]` handler must return the value returned by
+ * [WebsocketUpgrade::handle]. (This is done for you by `#[channel]`.)
  */
-#[must_use = "The Dropshot endpoint function must return the value of WebsocketUpgradeResponse::into_result for the connection to be upgraded correctly."]
-pub struct WebsocketUpgradeResponse<O: Send + 'static> {
-    result: Result<Response<Body>, HttpError>,
-    join_handle: Option<JoinHandle<WebsocketHandlerTaskResult<O>>>,
-}
+pub type WebsocketEndpointResult = Result<Response<Body>, HttpError>;
 
-impl<O: Send + 'static> WebsocketUpgradeResponse<O> {
-    /// Take the owned copy of the `tokio::task::JoinHandle` if desired for later use
-    /// (i.e. `.await` or `.abort()`).
-    pub fn take_join_handle(
-        &mut self,
-    ) -> Option<JoinHandle<WebsocketHandlerTaskResult<O>>> {
-        self.join_handle.take()
-    }
+/// TODO: document
+pub struct WebsocketConnection(HyperUpgraded);
 
-    /// Return the result containing the response headers to upgrade the connection.
-    /// This is a suitable return value for the dropshot endpoint's function.
-    pub fn into_result(self) -> Result<Response<Body>, HttpError> {
-        self.result
-    }
-}
-
-impl<O: Send + 'static> Into<Result<Response<Body>, HttpError>>
-    for WebsocketUpgradeResponse<O>
-{
-    fn into(self) -> Result<Response<Body>, HttpError> {
-        self.result
+impl WebsocketConnection {
+    /// Returns the raw [`HyperUpgraded`] connection.
+    pub fn into_inner(self) -> HyperUpgraded {
+        self.0
     }
 }
 
@@ -205,11 +184,12 @@ impl WebsocketUpgrade {
     * your endpoint's function, as it sends the headers to tell the HTTP
     * client that we are accepting the upgrade.
     *
-    * `handler` is a closure that accepts a [`HyperUpgraded`] connection
+    * `handler` is a closure that accepts a [`WebsocketConnection`]
     * and returns a future that will be spawned by this function,
-    * in which the `Upgraded` connection may be used with your choice of
-    * websocket-handling code operating over an [`tokio::io::AsyncRead`] and
-    * [`tokio::io::AsyncWrite`] type (e.g. `tokio_tungstenite`).
+    * in which the `WebsocketConnection`'s inner `Upgraded` connection may be
+    * used with your choice of websocket-handling code operating over an
+    * [`tokio::io::AsyncRead`] + [`tokio::io::AsyncWrite`] type
+    * (e.g. `tokio_tungstenite`).
     *
     * ```
       #[dropshot::channel { protocol = WEBSOCKETS, path = "/my/ws/endpoint/{id}" }]
@@ -217,52 +197,50 @@ impl WebsocketUpgrade {
           rqctx: std::sync::Arc<dropshot::RequestContext<()>>,
           websock: dropshot::WebsocketUpgrade,
           id: dropshot::Path<String>,
-      ) -> Result<http::Response<hyper::Body>, dropshot::HttpError> {
+      ) -> Result<dropshot::WebsocketEndpointResult> {
           let logger = rqctx.log.new(slog::o!());
           websock.handle(move |upgraded| async move {
               slog::info!(logger, "Entered handler for ID {}", id.into_inner());
               use futures_util::stream::StreamExt;
               let mut ws_stream = tokio_tungstenite::WebSocketStream::from_raw_socket(
-                  upgraded, tungstenite::protocol::Role::Server, None
+                  upgraded.into_inner(), tungstenite::protocol::Role::Server, None
               ).await;
               slog::info!(logger, "Received from websocket: {:?}", ws_stream.next().await);
               Ok(())
-          }).into()
+          })
       }
     * ```
     */
-    pub fn handle<C, F, O>(mut self, handler: C) -> WebsocketUpgradeResponse<O>
+    pub fn handle<C, F>(mut self, handler: C) -> WebsocketEndpointResult
     where
-        C: FnOnce(HyperUpgraded) -> F + Send + 'static,
-        F: Future<Output = WebsocketHandlerTaskResult<O>> + Send + 'static,
-        O: Send + 'static,
+        C: FnOnce(WebsocketConnection) -> F + Send + 'static,
+        F: Future<Output = WebsocketChannelResult> + Send + 'static,
     {
         // we .take() here to tell Drop::drop that we handled the request.
         match self.0.take() {
-            None => WebsocketUpgradeResponse {
-                result: Err(HttpError::for_internal_error(
-                    "Tried to handle websocket twice".to_string(),
-                )),
-                join_handle: None,
-            },
+            None => Err(HttpError::for_internal_error(
+                "Tried to handle websocket twice".to_string(),
+            )),
             Some(WebsocketUpgradeInner {
                 upgrade_fut,
                 accept_key,
                 ws_log,
                 ..
             }) => {
-                let join_handle = tokio::spawn(async move {
+                tokio::spawn(async move {
                     match upgrade_fut.await {
-                        Ok(upgrade) => match handler(upgrade).await {
-                            Ok(x) => Ok(x),
-                            Err(e) => {
-                                error!(
-                                    ws_log,
-                                    "Error returned from handler: {:?}", e
-                                );
-                                Err(e)
+                        Ok(upgrade) => {
+                            match handler(WebsocketConnection(upgrade)).await {
+                                Ok(x) => Ok(x),
+                                Err(e) => {
+                                    error!(
+                                        ws_log,
+                                        "Error returned from handler: {:?}", e
+                                    );
+                                    Err(e)
+                                }
                             }
-                        },
+                        }
                         Err(e) => {
                             error!(
                                 ws_log,
@@ -272,34 +250,25 @@ impl WebsocketUpgrade {
                         }
                     }
                 });
-                WebsocketUpgradeResponse {
-                    result: Response::builder()
-                        .status(StatusCode::SWITCHING_PROTOCOLS)
-                        .header(header::CONNECTION, "Upgrade")
-                        .header(header::UPGRADE, "websocket")
-                        .header(header::SEC_WEBSOCKET_ACCEPT, accept_key)
-                        .body(Body::empty())
-                        .map_err(Into::into),
-                    join_handle: Some(join_handle),
-                }
+                Response::builder()
+                    .status(StatusCode::SWITCHING_PROTOCOLS)
+                    .header(header::CONNECTION, "Upgrade")
+                    .header(header::UPGRADE, "websocket")
+                    .header(header::SEC_WEBSOCKET_ACCEPT, accept_key)
+                    .body(Body::empty())
+                    .map_err(Into::into)
             }
         }
-    }
-
-    /// Explicitly indicate that we do not wish to upgrade this connection.
-    pub fn do_not_upgrade(mut self) {
-        self.0.take();
     }
 }
 
 impl Drop for WebsocketUpgrade {
     fn drop(&mut self) {
         if let Some(inner) = self.0.take() {
-            if cfg!(test) || cfg!(debug_assertions) {
-                panic!("Didn't handle websocket in route {}", inner.route);
-            } else {
-                warn!(inner.ws_log, "Didn't handle websocket in route {}", inner.route);
-            }
+            debug!(
+                inner.ws_log,
+                "Didn't handle websocket in route {}", inner.route
+            );
         }
     }
 }
@@ -377,41 +346,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_ws_upg_no_panic_if_handled() {
+    async fn test_ws_upg_task_is_spawned() {
+        let (send, recv) = tokio::sync::oneshot::channel();
         ws_upg_from_mock_rqctx()
             .await
             .unwrap()
-            .handle(move |_upgrade| async move { Ok(()) })
-            .into_result()
-            .unwrap();
-    }
-
-    #[tokio::test]
-    #[should_panic]
-    async fn test_ws_upg_panics_if_unused() {
-        match ws_upg_from_mock_rqctx().await {
-            Ok(_ws_upg) => {} // do nothing so we panic on drop
-            Err(e) => {
-                eprintln!("Failed to construct WebsocketUpgrade: {:?}", e)
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn test_ws_upg_no_panic_if_explicitly_discarded() {
-        ws_upg_from_mock_rqctx().await.unwrap().do_not_upgrade();
-    }
-
-    #[tokio::test]
-    async fn test_ws_upg_task_is_spawned() {
-        let join_handle = ws_upg_from_mock_rqctx()
-            .await
-            .unwrap()
-            .handle(move |_upgrade| async move { Ok(()) })
-            .take_join_handle()
+            .handle(move |_upgrade| async move { Ok(send.send(()).unwrap()) })
             .unwrap();
         // note: not a real connection, so we don't get our future's Ok, but we *do* spawn the task
-        let _ = tokio::time::timeout(Duration::from_secs(1), join_handle)
+        let _ = tokio::time::timeout(Duration::from_secs(1), recv)
             .await
             .expect("Task not spawned or never completed");
     }

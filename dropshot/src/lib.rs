@@ -667,9 +667,10 @@ pub use pagination::WhichPage;
 pub use server::ServerContext;
 pub use server::{HttpServer, HttpServerStarter};
 pub use websocket::HyperUpgraded;
-pub use websocket::WebsocketHandlerTaskResult;
+pub use websocket::WebsocketChannelResult;
+pub use websocket::WebsocketConnection;
+pub use websocket::WebsocketEndpointResult;
 pub use websocket::WebsocketUpgrade;
-pub use websocket::WebsocketUpgradeResponse;
 
 /*
  * Users of the `endpoint` macro need the following macros:
@@ -678,5 +679,5 @@ pub use handler::RequestContextArgument;
 pub use http::Method;
 
 extern crate dropshot_endpoint;
-pub use dropshot_endpoint::endpoint;
 pub use dropshot_endpoint::channel;
+pub use dropshot_endpoint::endpoint;

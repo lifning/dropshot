@@ -15,6 +15,7 @@
  * JSON body length)
  */
 
+use dropshot::channel;
 use dropshot::endpoint;
 use dropshot::test_util::object_delete;
 use dropshot::test_util::read_json;
@@ -32,7 +33,8 @@ use dropshot::Query;
 use dropshot::RequestContext;
 use dropshot::TypedBody;
 use dropshot::UntypedBody;
-use dropshot::WebsocketUpgrade;
+use dropshot::WebsocketChannelResult;
+use dropshot::WebsocketConnection;
 use dropshot::CONTENT_TYPE_JSON;
 use futures_util::SinkExt;
 use futures_util::StreamExt;
@@ -962,29 +964,25 @@ async fn demo_handler_headers(
     Ok(response)
 }
 
-#[endpoint {
-    method = GET,
+#[channel {
+    protocol = WEBSOCKETS,
     path = "/testing/websocket"
 }]
 async fn demo_handler_websocket(
     rqctx: RequestCtx,
-    websock: WebsocketUpgrade,
-) -> Result<Response<Body>, HttpError> {
-    websock
-        .handle(move |upgraded| async move {
-            use futures_util::stream::StreamExt;
-            let mut ws_stream =
-                WebSocketStream::from_raw_socket(upgraded, Role::Server, None)
-                    .await;
-            ws_stream
-                .send(Message::Text("hello client".to_string()))
-                .await
-                .unwrap();
-            let msg = ws_stream.next().await.unwrap().unwrap();
-            slog::info!(rqctx.log, "{}", msg);
-            Ok(())
-        })
-        .into()
+    upgraded: WebsocketConnection,
+) -> WebsocketChannelResult {
+    use futures_util::stream::StreamExt;
+    let mut ws_stream = WebSocketStream::from_raw_socket(
+        upgraded.into_inner(),
+        Role::Server,
+        None,
+    )
+    .await;
+    ws_stream.send(Message::Text("hello client".to_string())).await.unwrap();
+    let msg = ws_stream.next().await.unwrap().unwrap();
+    slog::info!(rqctx.log, "{}", msg);
+    Ok(())
 }
 
 fn http_echo<T: Serialize>(t: &T) -> Result<Response<Body>, HttpError> {

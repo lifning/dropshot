@@ -10,6 +10,7 @@
  */
 #![allow(clippy::style)]
 
+use std::ops::DerefMut;
 use quote::format_ident;
 use quote::quote;
 use quote::{quote_spanned, ToTokens};
@@ -119,12 +120,11 @@ fn do_endpoint(
     item: proc_macro2::TokenStream,
 ) -> Result<(proc_macro2::TokenStream, Vec<Error>), Error> {
     let metadata = from_tokenstream(&attr)?;
-    let ast = syn::parse2(item.clone())?;
     // factored this way for now so #[channel] can use it too
-    do_endpoint_inner(metadata, ast, attr, item)
+    do_endpoint_inner(metadata, attr, item)
 }
 
-/// TODO: document
+/// This attribute
 #[proc_macro_attribute]
 pub fn channel(
     attr: proc_macro::TokenStream,
@@ -144,10 +144,67 @@ fn do_channel(
         unpublished,
         _dropshot_crate,
     } = from_tokenstream(&attr)?;
-    let ast = syn::parse2(item.clone())?;
-
     match protocol {
         ChannelProtocol::WEBSOCKETS => {
+            // here we construct a wrapper function and mutate the arguments a bit
+            // for the outer layer: we replace WebsocketConnection, which is not
+            // an extractor, with WebsocketUpgrade, which is.
+            let ItemFnForSignature {
+                attrs,
+                vis,
+                mut sig,
+                _block: body
+            } = syn::parse2(item)?;
+
+            let inner_args = sig.inputs.clone();
+            let inner_output = sig.output.clone();
+
+            let arg_names: Vec<_> = inner_args.iter()
+                .map(|arg: &syn::FnArg| {
+                    match arg {
+                        syn::FnArg::Receiver(r) => r.self_token.to_token_stream(),
+                        syn::FnArg::Typed(syn::PatType { pat, .. }) => pat.to_token_stream(),
+                    }
+                })
+                .collect();
+            let found = sig.inputs.iter_mut()
+                .nth(1)
+                .and_then(|arg| {
+                    if let syn::FnArg::Typed(
+                        syn::PatType { pat, ty, .. }
+                    ) = arg {
+                        if let syn::Pat::Ident(syn::PatIdent { ident, .. }) = pat.deref_mut() {
+                            let conn_type = ty.clone();
+                            let conn_name = ident.clone();
+                            let span = ident.span();
+                            *ident = syn::Ident::new("__dropshot_websocket_upgrade", span);
+                            *ty = Box::new(syn::Type::Verbatim(quote!{ dropshot::WebsocketUpgrade }));
+                            return Some((conn_name, conn_type));
+                        }
+                    }
+                    return None
+                });
+            if found.is_none() {
+                return Err(Error::new_spanned(
+                    &attr,
+                    "An argument of type dropshot::WebsocketConnection must be provided immediately following Arc<RequestContext<T>>.",
+                ));
+            }
+
+            sig.output = syn::parse2(quote!(-> dropshot::WebsocketEndpointResult))?;
+
+            let (conn_name, conn_type) = found.unwrap();
+
+            let new_item = quote! {
+                #(#attrs)*
+                #vis #sig {
+                    async fn __dropshot_websocket_handler(#inner_args) #inner_output #body
+                    __dropshot_websocket_upgrade.handle(move | #conn_name: #conn_type | async move {
+                        __dropshot_websocket_handler(#(#arg_names),*).await
+                    })
+                }
+            };
+
             let metadata = EndpointMetadata {
                 method: MethodType::GET,
                 path,
@@ -156,7 +213,7 @@ fn do_channel(
                 content_type: Some("application/json".to_string()),
                 _dropshot_crate: None
             };
-            do_endpoint_inner(metadata, ast, attr, item)
+            do_endpoint_inner(metadata, attr, new_item)
         }
     }
 }
@@ -180,10 +237,10 @@ fn do_output(res: Result<(proc_macro2::TokenStream, Vec<Error>), Error>) -> proc
 
 fn do_endpoint_inner(
     metadata: EndpointMetadata,
-    ast: ItemFnForSignature,
     attr: proc_macro2::TokenStream,
     item: proc_macro2::TokenStream,
 ) -> Result<(proc_macro2::TokenStream, Vec<Error>), Error> {
+    let ast: ItemFnForSignature = syn::parse2(item.clone())?;
     let method = metadata.method.as_str();
     let path = metadata.path;
     let content_type =

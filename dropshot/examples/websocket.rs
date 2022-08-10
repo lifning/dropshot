@@ -3,20 +3,19 @@
  * Example use of Dropshot with a websocket endpoint.
  */
 
-use dropshot::{ApiDescription, Query};
+use dropshot::channel;
+use dropshot::ApiDescription;
 use dropshot::ConfigDropshot;
 use dropshot::ConfigLogging;
 use dropshot::ConfigLoggingLevel;
-use dropshot::HttpError;
 use dropshot::HttpServerStarter;
+use dropshot::Query;
 use dropshot::RequestContext;
-use dropshot::{channel, WebsocketUpgrade};
+use dropshot::WebsocketConnection;
 use futures_util::SinkExt;
-use http::Response;
-use hyper::Body;
-use std::sync::Arc;
 use schemars::JsonSchema;
 use serde::Deserialize;
+use std::sync::Arc;
 use tungstenite::protocol::Role;
 use tungstenite::Message;
 
@@ -79,22 +78,18 @@ struct QueryParams {
 }]
 async fn example_api_websocket_counter(
     _rqctx: Arc<RequestContext<()>>,
-    ws_upg: WebsocketUpgrade,
+    upgraded: WebsocketConnection,
     qp: Query<QueryParams>,
-) -> Result<Response<Body>, HttpError> {
-    ws_upg
-        .handle(move |upgraded| async move {
-            let mut ws = tokio_tungstenite::WebSocketStream::from_raw_socket(
-                upgraded,
-                Role::Server,
-                None,
-            )
-            .await;
-            let mut count = qp.into_inner().start.unwrap_or(0);
-            while ws.send(Message::Binary(vec![count])).await.is_ok() {
-                count = count.wrapping_add(1);
-            }
-            Ok(())
-        })
-        .into_result()
+) -> dropshot::WebsocketChannelResult {
+    let mut ws = tokio_tungstenite::WebSocketStream::from_raw_socket(
+        upgraded.into_inner(),
+        Role::Server,
+        None,
+    )
+    .await;
+    let mut count = qp.into_inner().start.unwrap_or(0);
+    while ws.send(Message::Binary(vec![count])).await.is_ok() {
+        count = count.wrapping_add(1);
+    }
+    Ok(())
 }
